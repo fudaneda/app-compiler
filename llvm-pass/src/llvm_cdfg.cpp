@@ -1,5 +1,6 @@
 
 #include "llvm_cdfg.h"
+#include "llvm/IR/Operator.h" // for GEPOperator::getSourceElementType
 
 //#include "cgra.h"
 
@@ -377,9 +378,28 @@ void LLVMCDFG::initialize()
                 for (unsigned index = 1; index < CE->getNumOperands(); ++index) {
                     Indices.push_back (CE->getOperand(index));
                 }
-                auto pointeeType = dyn_cast<PointerType>(CE->getOperand(0)->getType()->getScalarType())->getElementType();
+                // In LLVM 15 with opaque pointers, PointerType no longer exposes element type.
+                // The ConstantExpr here should be a GEP; obtain the source element type from it.
+                Type *pointeeType = nullptr;
+                if (auto *GEPConst = dyn_cast<GEPOperator>(CE)) {
+                    pointeeType = GEPConst->getSourceElementType();
+                } else if (auto *PtrTy = dyn_cast<PointerType>(CE->getOperand(0)->getType()->getScalarType())) {
+                    // Fallback for typed-pointer builds (older LLVMs)
+                    // Note: getElementType() is removed in newer LLVM; guarded by dyn_cast above.
+#if LLVM_VERSION_MAJOR < 15
+                    pointeeType = PtrTy->getElementType();
+#endif
+                }
+                if (!pointeeType) {
+                    // As a last resort, try to infer from the pointer operand's value type
+                    // when it is a GlobalVariable or AllocaInst.
+                    if (auto *GV = dyn_cast<GlobalValue>(CE->getOperand(0))) {
+                        pointeeType = GV->getValueType();
+                    }
+                }
+                assert(pointeeType && "Failed to determine GEP source element type");
                 pointeeType->dump();
-                GEP = GetElementPtrInst::CreateInBounds(pointeeType,CE->getOperand(0),Indices,CE->getName(),ins);
+                GEP = GetElementPtrInst::CreateInBounds(pointeeType, CE->getOperand(0), Indices, CE->getName(), ins);
                 ins->replaceUsesOfWith(CE, GEP);
             }
         }
