@@ -314,7 +314,10 @@ public:
 
     // generate MAC nodes
     void genMACNodes();
-	
+
+    // split llvm.fmuladd.* intrinsic calls into FMUL + FADD nodes
+    void splitFmulAddCalls();
+	 
 			
 };
 

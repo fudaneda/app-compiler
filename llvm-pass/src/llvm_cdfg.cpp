@@ -1,6 +1,8 @@
 
 #include "llvm_cdfg.h"
 #include "llvm/IR/Operator.h" // for GEPOperator::getSourceElementType
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 
 //#include "cgra.h"
 
@@ -1987,6 +1989,12 @@ void LLVMCDFG::assignFinalNodeName()
             case Instruction::PHI:
                 //node->setFinalInstruction("SELECT");
                 break;
+            case Instruction::Call: {
+                // 所有 fmuladd 已在前序步骤拆分为 FMUL+FADD；其它调用不应在此阶段出现。
+                ins->dump();
+                assert(false && "Unexpected Call instruction after normalization");
+                break;
+            }
             default:
                 ins->dump();
                 assert(false);
@@ -4823,6 +4831,52 @@ void LLVMCDFG::printDOT(std::string fileName) {
 	ofs.close();
 }
 
+// Split llvm.fmuladd.* into FMUL + FADD in the CDFG
+void LLVMCDFG::splitFmulAddCalls(){
+    std::map<int, LLVMCDFGNode *> nodes = _nodes; // snapshot to iterate safely
+    for(auto &elem : nodes){
+        LLVMCDFGNode* node = elem.second;
+        Instruction *ins = node->instruction();
+        if(!ins) continue;
+        auto *CI = dyn_cast<CallInst>(ins);
+        if(!CI) continue;
+        // Identify llvm.fmuladd.* intrinsic
+        bool isFMAdd = false;
+        if (auto *II = dyn_cast<IntrinsicInst>(CI)){
+            isFMAdd = (II->getIntrinsicID() == Intrinsic::fmuladd);
+        } else if(Function *F = CI->getCalledFunction()){
+            StringRef n = F->getName();
+            isFMAdd = n.startswith("llvm.fmuladd");
+        }
+        if(!isFMAdd) continue;
+
+        // Expect three inputs: a, b, c
+        LLVMCDFGNode *a = node->getInputPort(0);
+        LLVMCDFGNode *b = node->getInputPort(1);
+        LLVMCDFGNode *c = node->getInputPort(2);
+        if(!(a && b && c)){
+            // If ports are not assigned as expected, skip safely
+            continue;
+        }
+
+        // Create FMUL node and wire a,b -> FMUL
+        LLVMCDFGNode *mulNode = addNode("FMUL", node->BB());
+        connectNodes(a, mulNode, 0, EDGE_TYPE_DATA);
+        connectNodes(b, mulNode, 1, EDGE_TYPE_DATA);
+
+        // Remove edges a->node and b->node
+        if(auto e = edge(a, node)) delEdge(e);
+        if(auto e = edge(b, node)) delEdge(e);
+
+        // Wire FMUL -> node at operand 0, and move c to operand 1
+        connectNodes(mulNode, node, 0, EDGE_TYPE_DATA);
+        node->setInputIdx(c, 1);
+
+        // Mark the call node as FADD so final naming is clean
+        node->setCustomInstruction("FADD");
+    }
+}
+
 void LLVMCDFG::printHierarchyDOT(std::string fileName) {
 #ifndef DUMP_TMP_CDFG
     return;
@@ -5464,6 +5518,9 @@ void LLVMCDFG::generateCDFG()
 
     auto nestloops = this->nestloops();
     errs() << nestloops.size() << "\n";
+
+    // Normalize intrinsic fmuladd to plain FMUL + FADD before further transforms
+    splitFmulAddCalls();
 
     LoopIdxAnalyze();
 
