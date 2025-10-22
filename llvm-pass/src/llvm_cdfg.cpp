@@ -3,6 +3,26 @@
 #include "llvm/IR/Operator.h" // for GEPOperator::getSourceElementType
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
+#include <sstream>
+#include <iomanip>
+
+// Format constant as decimal integer of bit pattern for FP constants
+static std::string formatConstForNode(LLVMCDFGNode* n){
+    std::ostringstream oss;
+    uint64_t v = (uint64_t)n->constVal();
+    if(n->dataBits() == 32){
+        uint32_t u32 = (uint32_t)v;
+        oss << u32; // print as uint32 decimal
+        return oss.str();
+    }else if(n->dataBits() == 64){
+        uint64_t u64 = v;
+        oss << u64; // print as uint64 decimal
+        return oss.str();
+    }else{
+        oss << (int64_t)v; // fallback for integer constants
+        return oss.str();
+    }
+}
 
 //#include "cgra.h"
 
@@ -450,16 +470,19 @@ void LLVMCDFG::initialize()
                             continue;
                         }
                         inputNode = addNode("CONST", node->BB());
-                        inputNode->setConstVal(CI->getSExtValue());
+                        inputNode->setConstVal((DataType)CI->getSExtValue());
                     }else if(ConstantFP* FP = dyn_cast<ConstantFP>(pred)){
                         if(dyn_cast<GetElementPtrInst>(ins)){ // GEP Constant will be handled in the handleGEPNodes
                             idx++;
                             continue;
                         }
-                        // int constant = (int)FP->getValueAPF().convertToFloat();
-                        int constant = (DataType)FP->getValueAPF().convertToDouble();
+                        // Bitcast FP constant to its IEEE-754 bit pattern
+                        APInt api = FP->getValueAPF().bitcastToAPInt();
+                        DataType bits = api.getZExtValue();
                         inputNode = addNode("CONST", node->BB());
-                        inputNode->setConstVal(constant);
+                        inputNode->setConstVal(bits);
+                        // Record data width to distinguish FP constants when printing
+                        inputNode->setDataBits((int)pred->getType()->getPrimitiveSizeInBits());
                     }else if(Instruction *predIns = dyn_cast<Instruction>(pred)){
                         if(!allBBs.count(predIns->getParent()) || _ExInsList.count(predIns)){ // out of loop BB
                             if(auto LI = dyn_cast<LoadInst>(predIns)){
@@ -1136,14 +1159,17 @@ void LLVMCDFG::handlePHINodes()
             LLVMCDFGNode* phiParent = NULL;
             
             if(ConstantInt* CI = dyn_cast<ConstantInt>(V)){
-				int constant = CI->getSExtValue();
+				DataType constant = (DataType)CI->getSExtValue();
                 phiParent = addNode("CONST", bb);
                 phiParent->setConstVal(constant);
 			}else if(ConstantFP* FP = dyn_cast<ConstantFP>(V)){
-				// int constant = (DataType)FP->getValueAPF().convertToFloat();
-                int constant = (DataType)FP->getValueAPF().convertToDouble();
+                // Bitcast FP constant to its IEEE-754 bit pattern
+                APInt api = FP->getValueAPF().bitcastToAPInt();
+                DataType constant = api.getZExtValue();
                 phiParent = addNode("CONST", bb);
                 phiParent->setConstVal(constant);
+                // Record data width for printing
+                phiParent->setDataBits((int)V->getType()->getPrimitiveSizeInBits());
 			}else if(UndefValue *UND = dyn_cast<UndefValue>(V)){
                 phiParent = addNode("CONST", bb);
                 phiParent->setConstVal(0);
@@ -1164,15 +1190,17 @@ void LLVMCDFG::handlePHINodes()
                             V = ins->getOperand(0);
                             if (ConstantInt *CI = dyn_cast<ConstantInt>(V))
                             {
-                                int constant = CI->getSExtValue();
+                                DataType constant = (DataType)CI->getSExtValue();
                                 phiParent = addNode("CONST", bb);
                                 phiParent->setConstVal(constant);
                             }
                             else if (ConstantFP *FP = dyn_cast<ConstantFP>(V))
                             {
-                                DataType constant = (DataType)FP->getValueAPF().convertToFloat();
+                                APInt api = FP->getValueAPF().bitcastToAPInt();
+                                DataType constant = api.getZExtValue();
                                 phiParent = addNode("CONST", bb);
                                 phiParent->setConstVal(constant);
+                                phiParent->setDataBits((int)V->getType()->getPrimitiveSizeInBits());
                             }
                         }
                         else if(phi2selectMap.count(phiParent)){ // PHI parent has been transformed to SELECT node
@@ -1653,14 +1681,14 @@ void LLVMCDFG::handleGEPNodes()
         }
         int LSoffset = 0;
         if(node->constVal() != 0){///add const offset of GEP
-            LSoffset = node->constVal();
+            LSoffset = (int)node->constVal();
         }
         //connect output of GEP to GEPAdd
         assert(GEPAdd != NULL);
         for(auto outputNode : node->outputNodes()){
             auto ins = outputNode->instruction();
             if(dyn_cast<LoadInst>(ins) || dyn_cast<StoreInst>(ins)){
-                outputNode->setLSoffset(node->constVal());
+                outputNode->setLSoffset((int)node->constVal());
             }
             outputNode->addInputNode(GEPAdd, outputNode->delInputNode(node));
             GEPAdd->addOutputNode(outputNode);
@@ -2061,7 +2089,7 @@ std::pair<int, varType> BinaryConstOp(LLVMCDFGNode* Bn, std::map<LLVMCDFGNode *,
         auto BnInputNode = Bn->getInputPort(i);
         if (BnInputNode->hasConst())
         {
-            constOp = BnInputNode->constVal();
+            constOp = (int)BnInputNode->constVal();
             OperandIndex = i;
             //errs() << "\t" << "Instructions: " << Bi->getName().str() << "\n";
         }else if (BnInputNode->hasArgIn()){
@@ -2095,7 +2123,15 @@ LLVMCDFGNode* LLVMCDFG::addNodeTree(Value* opnode){
     if(auto CT = dyn_cast<Constant>(opnode)){
         ///TODO:bugs when coming accross address of global reg
         LLVMCDFGNode* newnode = addNode("CONST");
-        newnode->setConstVal(castConstInt(CT));
+        if(auto CI = dyn_cast<ConstantInt>(CT)){
+            newnode->setConstVal((DataType)CI->getSExtValue());
+        }else if(auto FP = dyn_cast<ConstantFP>(CT)){
+            APInt api = FP->getValueAPF().bitcastToAPInt();
+            newnode->setConstVal(api.getZExtValue());
+            newnode->setDataBits((int)CT->getType()->getPrimitiveSizeInBits());
+        }else{
+            newnode->setConstVal(0);
+        }
         return newnode;
     //PHI will be handled in arraystride()
     }else if(auto Phi = dyn_cast<PHINode>(opnode)){
@@ -2929,7 +2965,7 @@ std::vector<int> LLVMCDFG::arrayStride(LLVMCDFGNode* opnode, std::map<int, std::
                 errs() << "\t\tACC: " << opnode->getName() << " is the same as level " << CummuInitialLevel << "\n";
                 level = CummuInitialLevel;
                 if(ACCinput->hasConst()){
-                    stride = ACCinput->constVal();
+                    stride = (int)ACCinput->constVal();
                 }else if(_IOInfoMap.count(ACCinput)){
                     stride = _IOInfoMap[ACCinput];
                 }else{
@@ -4758,6 +4794,7 @@ void LLVMCDFG::printDOT(std::string fileName) {
 	std::ofstream ofs;
 	ofs.open(fileName.c_str());
     ofs << "Digraph G {\n";
+    // use helper to format constants
     // nodes
 	assert(_nodes.size() != 0);
     for(auto &elem : _nodes){
@@ -4785,7 +4822,7 @@ void LLVMCDFG::printDOT(std::string fileName) {
             ofs << "]";
         }
         if(node->hasConst()){
-            ofs << ", Const=" << node->constVal();
+            ofs << ", Const=" << formatConstForNode(node);
         }
         ofs << "\", shape = box, color = black];\n";
     }
@@ -4919,7 +4956,7 @@ void LLVMCDFG::printHierarchyDOT(std::string fileName) {
                 ofs << "]";
             }
             if(node->hasConst()){
-                ofs << ", Const=" << node->constVal();
+                ofs << ", Const=" << formatConstForNode(node);
             }
             ofs << "\", shape = box, color = black];\n";
         }
@@ -5053,8 +5090,8 @@ void LLVMCDFG::printAffineDOT(std::string fileName) {
             }
         }
         else if(node->hasConst()){
-            ofs << ", label=\""<<name<< ", Const="<< node->constVal() << "\"";
-            ofs << ", value="<<node->constVal();
+            ofs << ", label=\""<<name<< ", Const="<< formatConstForNode(node) << "\"";
+            ofs << ", value="<< formatConstForNode(node);
         }else if(node->hasArgIn()){
             ofs << ", argNum=" << node->argNum();
         }
@@ -5338,8 +5375,8 @@ void LLVMCDFG::printAsSubTask(std::ofstream &ofs, int kernel) {
             ofs << ", acc_first=" << node->isAccFirst();
         }
         else if(node->hasConst()){
-            ofs << ", label=\""<<name<< ", Const="<< node->constVal() << "\"";
-            ofs << ", value="<<node->constVal();
+            ofs << ", label=\""<<name<< ", Const="<< formatConstForNode(node) << "\"";
+            ofs << ", value="<< formatConstForNode(node);
         }else if(node->hasArgIn()){
             ofs << ", argNum=" << node->argNum();
         }
@@ -5410,7 +5447,7 @@ void LLVMCDFG::printAsSubTask(std::ofstream &ofs, int kernel) {
         }
         else if(node->customInstruction() != ""){
             if(node->hasConst()){
-                ofs << ", value=" << node->constVal();
+                ofs << ", value=" << formatConstForNode(node);
             }
         }
         else if(ins != NULL){

@@ -49,8 +49,10 @@
 #include <algorithm>
 #include <map>
 
+#include <cstdint>
 #define MAX_DATA_BYTES 4
-typedef int DataType;
+// Use 64-bit to hold constant bit patterns (supports fp32/fp64)
+typedef uint64_t DataType;
 
 using namespace llvm;
 
