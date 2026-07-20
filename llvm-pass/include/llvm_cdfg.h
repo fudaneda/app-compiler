@@ -303,6 +303,9 @@ public:
     // remove affine address calculation & generate INPUT/OUTPUT pattern
     void handleAffineLSNodes();
 
+    // Extract conservative load-add-store memory reductions as ACC nodes.
+    void generateMemoryReductionACC();
+
     // transform add result SELECT tree to add operand SELECT tree
     void transAddOpSelectTree();
     // generate ACC node

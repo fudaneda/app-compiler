@@ -3425,6 +3425,154 @@ void LLVMCDFG::handleAffineLSNodes(){
     }
 }
 
+// Extract an affine memory recurrence of the following form:
+//
+//   value = load address
+//   result = value + term
+//   store result, address
+//
+// into ACC(term), followed by initial_value + running_prefix. ACC produces
+// one running-prefix token for every input token, so the original load/store
+// access patterns and token rates must be preserved.
+// This is deliberately conservative: only an unconditional innermost-loop
+// integer ADD is accepted, and the symbolic memory object must have exactly
+// this load/store pair. Different ref_name objects are independent in the
+// affine CGRA memory model.
+void LLVMCDFG::generateMemoryReductionACC(){
+    if(!isloopsAffine() || getLoopsAffineCounts().size() < 2){
+        return;
+    }
+
+    auto sameVar = [](varType lhs, varType rhs){
+        return lhs.to_string() == rhs.to_string();
+    };
+    auto sameAffineAddress = [&](LLVMCDFGNode *loadNode, LLVMCDFGNode *storeNode){
+        if(!loadNode->isLSaffine() || !storeNode->isLSaffine()){
+            return false;
+        }
+        if(loadNode->getLSaddress() != storeNode->getLSaddress() ||
+           loadNode->dataBits() != storeNode->dataBits() ||
+           !sameVar(loadNode->getLSoffset(), storeNode->getLSoffset()) ||
+           !sameVar(loadNode->getLSstart(), storeNode->getLSstart())){
+            return false;
+        }
+
+        auto loadStride = loadNode->getLSstride();
+        auto storeStride = storeNode->getLSstride();
+        if(loadStride.size() != storeStride.size()){
+            return false;
+        }
+        for(auto &levelStride : loadStride){
+            auto iter = storeStride.find(levelStride.first);
+            if(iter == storeStride.end() || !sameVar(levelStride.second, iter->second)){
+                return false;
+            }
+        }
+
+        auto loadBounds = loadNode->getLSbounds();
+        auto storeBounds = storeNode->getLSbounds();
+        for(int i = 0; i < 3; i++){
+            if(!sameVar(loadBounds[i], storeBounds[i])){
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Work on a snapshot because new ACC nodes are appended to _nodes.
+    auto stores = _storeList;
+    for(auto storeNode : stores){
+        auto storeIns = dyn_cast_or_null<StoreInst>(storeNode->instruction());
+        if(storeIns == NULL || !storeIns->isSimple() || storeNode->getInputPort(2) != NULL){
+            continue;
+        }
+
+        auto resultNode = storeNode->getInputPort(0);
+        if(resultNode == NULL || resultNode->BB() != storeNode->BB() ||
+           resultNode->outputNodes().size() != 1 || resultNode->outputNodes()[0] != storeNode){
+            continue;
+        }
+        auto addIns = dyn_cast_or_null<BinaryOperator>(resultNode->instruction());
+        if(addIns == NULL || addIns->getOpcode() != Instruction::Add ||
+           !addIns->getType()->isIntegerTy() || resultNode->inputNodes().size() != 2){
+            continue;
+        }
+
+        LLVMCDFGNode *loadNode = NULL;
+        LLVMCDFGNode *termNode = NULL;
+        int termPort = -1;
+        for(int port = 0; port < 2; port++){
+            auto input = resultNode->getInputPort(port);
+            if(input != NULL && dyn_cast_or_null<LoadInst>(input->instruction()) != NULL){
+                loadNode = input;
+                termPort = 1 - port;
+                termNode = resultNode->getInputPort(termPort);
+                break;
+            }
+        }
+        LoadInst *loadIns = loadNode == NULL ? nullptr : dyn_cast<LoadInst>(loadNode->instruction());
+        if(loadIns == NULL || !loadIns->isSimple() || termNode == NULL ||
+           loadNode->BB() != resultNode->BB() || loadNode->getInputPort(1) != NULL ||
+           loadNode->outputNodes().size() != 1 || loadNode->outputNodes()[0] != resultNode ||
+           !sameAffineAddress(loadNode, storeNode)){
+            continue;
+        }
+
+        // Level 0 is the innermost loop in this compiler.
+        auto loadStride = loadNode->getLSstride();
+        if(loadStride.find(0) == loadStride.end() || !(loadStride[0] == 0) ||
+           !_LoopexclusiveBBs[0].count(resultNode->BB())){
+            continue;
+        }
+
+        // No other access to the symbolic object may observe or modify an
+        // intermediate recurrence value transformed by this ACC.
+        int accessesToObject = 0;
+        for(auto &elem : _nodes){
+            auto candidate = elem.second;
+            auto candidateIns = candidate->instruction();
+            if(candidateIns != NULL &&
+               (isa<LoadInst>(candidateIns) || isa<StoreInst>(candidateIns)) &&
+               candidate->getLSaddress() == loadNode->getLSaddress()){
+                accessesToObject++;
+            }
+        }
+        if(accessesToObject != 2){
+            continue;
+        }
+
+        auto termEdge = edge(termNode, resultNode);
+        if(termEdge == NULL || termEdge->type() != EDGE_TYPE_DATA){
+            continue;
+        }
+
+        auto accNode = addNode("ACC", resultNode->BB());
+        accNode->setAcc();
+        accNode->setInitial(0);
+        // The memory recurrence has no SELECT/feedback token that initializes
+        // the ACC separately. Its first term arrives on the reset cycle and
+        // must participate in the running prefix. Without acc_first=1, the
+        // first term of every reduction group is dropped.
+        accNode->setAccFirst();
+
+        varType count = getLoopsAffineCounts(0);
+        varType repeat = 1;
+        for(int level = 1; level < getLoopsAffineCounts().size(); level++){
+            repeat *= getLoopsAffineCounts(level);
+        }
+        accNode->setAccPattern(count, 1, repeat);
+
+        delEdge(termEdge);
+        connectNodes(termNode, accNode, 0, EDGE_TYPE_DATA);
+        connectNodes(accNode, resultNode, termPort, EDGE_TYPE_DATA);
+
+        outs() << "Extract memory reduction: " << loadNode->getName()
+               << " -> " << accNode->getName() << " -> "
+               << storeNode->getName() << "\n";
+    }
+}
+
+
 //to judge if a node is inline ADD or Custom ADD
 bool isADDNode(LLVMCDFGNode* node){
     auto ins = node->instruction();
@@ -5508,6 +5656,12 @@ void LLVMCDFG::generateCDFG()
     }
 
     accessAnalyze();
+
+    if(!_noACC && !_noPattern && isloopsAffine()){
+        outs() << ">>>>>> Extract affine memory reductions as ACC nodes\n";
+        generateMemoryReductionACC();
+        printDOT(_name + "_after_generateMemoryReductionACC.dot");
+    }
 
     if(!_noPattern && isloopsAffine()){
         outs() << ">>>>>> handle affine Access Node\n";
